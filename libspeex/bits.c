@@ -45,6 +45,13 @@
 #define MAX_CHARS_PER_FRAME (2000/BYTES_PER_CHAR)
 #endif
 
+/* Hard ceiling for a packet that drives an input-sized allocation.  A
+ * legitimate Speex frame is well below this; anything larger is truncated
+ * instead of letting a malformed packet grow the heap without bound. */
+#ifndef MAX_PACKET_CHARS
+#define MAX_PACKET_CHARS (65536/BYTES_PER_CHAR)
+#endif
+
 EXPORT void speex_bits_init(SpeexBits *bits)
 {
    bits->chars = (char*)speex_alloc(MAX_CHARS_PER_FRAME);
@@ -110,15 +117,28 @@ EXPORT void speex_bits_read_from(SpeexBits *bits, const char *chars, int len)
 {
    int i;
    int nchars = len / BYTES_PER_CHAR;
+   if (nchars < 0)
+   {
+      speex_warning("Negative packet length: ignoring input");
+      nchars = 0;
+   }
+   if (nchars > MAX_PACKET_CHARS)
+   {
+      speex_warning("Oversized packet: truncating input");
+      nchars = MAX_PACKET_CHARS;
+   }
    if (nchars > bits->buf_size)
    {
       speex_notify("Packet is larger than allocated buffer");
       if (bits->owner)
       {
-         char *tmp = (char*)speex_realloc(bits->chars, nchars);
+         int new_size = nchars;
+         if (new_size < bits->buf_size)
+            new_size = bits->buf_size;
+         char *tmp = (char*)speex_realloc(bits->chars, new_size);
          if (tmp)
          {
-            bits->buf_size=nchars;
+            bits->buf_size=new_size;
             bits->chars=tmp;
          } else {
             nchars=bits->buf_size;
@@ -128,6 +148,15 @@ EXPORT void speex_bits_read_from(SpeexBits *bits, const char *chars, int len)
          speex_warning("Do not own input buffer: truncating oversize input");
          nchars=bits->buf_size;
       }
+   }
+   if (nchars <= 0)
+   {
+      /* Nothing readable: reset the cursor without touching the buffer. */
+      bits->nbBits=0;
+      bits->charPtr=0;
+      bits->bitPtr=0;
+      bits->overflow=0;
+      return;
    }
 #if (BYTES_PER_CHAR==2)
 /* Swap bytes to proper endian order (could be done externally) */
@@ -158,6 +187,16 @@ EXPORT void speex_bits_read_whole_bytes(SpeexBits *bits, const char *chars, int 
    int i,pos;
    int nchars = nbytes/BYTES_PER_CHAR;
 
+   if (nchars < 0)
+   {
+      speex_warning("Negative packet length: ignoring input");
+      nchars = 0;
+   }
+   if (nchars > MAX_PACKET_CHARS)
+   {
+      speex_warning("Oversized packet: truncating input");
+      nchars = MAX_PACKET_CHARS;
+   }
    if (((bits->nbBits+BITS_PER_CHAR-1)>>LOG2_BITS_PER_CHAR)+nchars > bits->buf_size)
    {
       /* Packet is larger than allocated buffer */
@@ -177,6 +216,10 @@ EXPORT void speex_bits_read_whole_bytes(SpeexBits *bits, const char *chars, int 
          nchars=bits->buf_size-(bits->nbBits>>LOG2_BITS_PER_CHAR)-1;
       }
    }
+   /* A full (or inconsistent) buffer leaves no room, including after a
+      failed resize.  Clamp instead of shifting a negative count. */
+   if (nchars < 0)
+      nchars = 0;
 
    speex_bits_flush(bits);
    pos=bits->nbBits>>LOG2_BITS_PER_CHAR;
