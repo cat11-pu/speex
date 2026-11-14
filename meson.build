@@ -184,6 +184,10 @@ subdir('doc')
 subdir('include/speex')
 subdir('libspeex')
 
+if not get_option('test-binaries').disabled()
+  subdir('tests')
+endif
+
 if not get_option('tools').disabled()
   subdir('src')
 endif

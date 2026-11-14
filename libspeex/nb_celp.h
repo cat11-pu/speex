@@ -55,6 +55,7 @@
 #define NB_WINDOW_SIZE (NB_FRAME_SIZE+NB_SUBFRAME_SIZE)
 #define NB_EXCBUF (NB_FRAME_SIZE+NB_PITCH_END+2)
 #define NB_DEC_BUFFER (NB_FRAME_SIZE+2*NB_PITCH_END+NB_SUBFRAME_SIZE+12)
+#define NB_PLC_FADE 8
 /**Structure representing the full state of the narrowband encoder*/
 typedef struct EncState {
    const SpeexMode *mode;        /**< Mode corresponding to the state */
@@ -149,6 +150,9 @@ typedef struct DecState {
    spx_word16_t  last_pitch_gain; /**< Pitch gain of last correctly decoded frame */
    spx_word16_t  pitch_gain_buf[3]; /**< Pitch gain of last decoded frames */
    int    pitch_gain_buf_idx;   /**< Tail of the buffer */
+   spx_word16_t  last_out[NB_FRAME_SIZE]; /**< Last decoded output frame for PLC crossfade */
+   spx_word16_t  last_exc_rms[NB_NB_SUBFRAMES]; /**< Excitation energy envelope */
+   int    plc_fade;             /**< Samples left in the recovery crossfade */
    spx_uint32_t seed;            /** Seed used for random number generation */
 
    int    encode_submode;

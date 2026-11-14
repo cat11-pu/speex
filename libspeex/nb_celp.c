@@ -1093,6 +1093,9 @@ void *nb_decoder_init(const SpeexMode *m)
    st->count_lost=0;
    st->pitch_gain_buf[0] = st->pitch_gain_buf[1] = st->pitch_gain_buf[2] = 0;
    st->pitch_gain_buf_idx = 0;
+   SPEEX_MEMSET(st->last_out, 0, NB_FRAME_SIZE);
+   SPEEX_MEMSET(st->last_exc_rms, 0, NB_NB_SUBFRAMES);
+   st->plc_fade = 0;
    st->seed = 1000;
 
    st->sampling_rate=8000;
@@ -1185,6 +1188,9 @@ int nb_decoder_ctl(void *state, int request, void *ptr)
             st->mem_sp[i]=0;
          for (i=0;i<NB_FRAME_SIZE + NB_PITCH_END + 1;i++)
             st->excBuf[i]=0;
+         SPEEX_MEMSET(st->last_out, 0, NB_FRAME_SIZE);
+         SPEEX_MEMSET(st->last_exc_rms, 0, NB_NB_SUBFRAMES);
+         st->plc_fade = 0;
       }
       break;
    case SPEEX_SET_SUBMODE_ENCODING:
@@ -1262,15 +1268,77 @@ const spx_word16_t attenuation[10] = {1., 0.961, 0.852, 0.698, 0.527, 0.368, 0.2
 
 #endif
 
+static spx_word16_t plc_gain_q13(spx_word16_t target, spx_word16_t rms)
+{
+   if (target <= 0)
+      return 0;
+#ifdef FIXED_POINT
+   spx_word32_t gain;
+   if (rms < 1)
+      rms = 1;
+   gain = PDIV32(SHL32(EXTEND32(target), 13), rms);
+   if (gain > 12288)
+      gain = 12288;
+   if (gain < 2048)
+      gain = 2048;
+   return EXTRACT16(gain);
+#else
+   spx_word16_t gain;
+   gain = target/(rms+1e-9f);
+   if (gain > 1.5f)
+      gain = 1.5f;
+   if (gain < .25f)
+      gain = .25f;
+   return gain;
+#endif
+}
+
+static spx_word16_t plc_apply_gain(spx_word16_t gain, spx_word16_t x)
+{
+#ifdef FIXED_POINT
+   return EXTRACT16(SATURATE32(MULT16_16_Q13(gain, x), 32767));
+#else
+   return gain*x;
+#endif
+}
+
+static void plc_crossfade(DecState *st, spx_word16_t *out, int fade)
+{
+   int i;
+   spx_word16_t prev;
+   if (fade <= 0)
+      return;
+   if (fade > NB_PLC_FADE)
+      fade = NB_PLC_FADE;
+   prev = st->last_out[NB_FRAME_SIZE-1];
+   for (i=0;i<fade;i++)
+   {
+      spx_word16_t w;
+#ifdef FIXED_POINT
+      w = EXTRACT16(PDIV32(SHL32(EXTEND32(i), 15), fade));
+#else
+      w = (spx_word16_t)i/fade;
+#endif
+      out[i] = MULT16_16_Q15(SUB16(Q15ONE, w), prev) + MULT16_16_Q15(w, out[i]);
+   }
+}
+
+static void plc_update_last_out(DecState *st, const spx_word16_t *out)
+{
+   SPEEX_COPY(st->last_out, out, NB_FRAME_SIZE);
+}
+
 static void nb_decode_lost(DecState *st, spx_word16_t *out, char *stack)
 {
    int i;
+   int sub;
    int pitch_val;
    spx_word16_t pitch_gain;
    spx_word16_t fact;
    spx_word16_t gain_med;
    spx_word16_t innov_gain;
    spx_word16_t noise_gain;
+   VARDECL(spx_coef_t *plc_lpc);
 
    st->exc = st->excBuf + 2*NB_PITCH_END + NB_SUBFRAME_SIZE + 6;
 
@@ -1285,13 +1353,13 @@ static void nb_decode_lost(DecState *st, spx_word16_t *out, char *stack)
 
 #ifdef FIXED_POINT
    pitch_gain = st->last_pitch_gain;
-   if (pitch_gain>54)
-      pitch_gain = 54;
+   if (pitch_gain>60)
+      pitch_gain = 60;
    pitch_gain = SHL16(pitch_gain, 9);
 #else
    pitch_gain = GAIN_SCALING_1*st->last_pitch_gain;
-   if (pitch_gain>.85)
-      pitch_gain=.85;
+   if (pitch_gain>.94)
+      pitch_gain=.94;
 #endif
    pitch_gain = MULT16_16_Q15(fact,pitch_gain) + VERY_SMALL;
    /* FIXME: This was rms of innovation (not exc) */
@@ -1301,21 +1369,73 @@ static void nb_decode_lost(DecState *st, spx_word16_t *out, char *stack)
    SPEEX_MOVE(st->excBuf, st->excBuf+NB_FRAME_SIZE, 2*NB_PITCH_END + NB_SUBFRAME_SIZE + 12);
 
 
-   pitch_val = st->last_pitch + SHR32((spx_int32_t)speex_rand(1+st->count_lost, &st->seed),SIG_SHIFT);
+   /* Keep the continuation phase coherent.  Random pitch jumps turn a
+      periodic extrapolation into a click at the frame boundary. */
+   pitch_val = st->last_pitch;
    if (pitch_val > NB_PITCH_END)
       pitch_val = NB_PITCH_END;
    if (pitch_val < NB_PITCH_START)
       pitch_val = NB_PITCH_START;
    for (i=0;i<NB_FRAME_SIZE;i++)
    {
-      st->exc[i]= MULT16_16_Q15(pitch_gain, (st->exc[i-pitch_val]+VERY_SMALL)) +
+      spx_word16_t periodic = st->exc[i-pitch_val];
+#ifdef FIXED_POINT
+      if (st->last_pitch_gain <= 20)
+         periodic = 0;
+#else
+      if (st->last_pitch_gain <= .3f)
+         periodic = 0;
+#endif
+      st->exc[i]= MULT16_16_Q15(pitch_gain, periodic+VERY_SMALL) +
             speex_rand(noise_gain, &st->seed);
    }
 
-   bw_lpc(QCONST16(.98,15), st->interp_qlpc, st->interp_qlpc, NB_ORDER);
-   iir_mem16(&st->exc[-NB_SUBFRAME_SIZE], st->interp_qlpc, out, NB_FRAME_SIZE,
+   /* Match the excitation envelope with a smoothed per-subframe gain. */
+   {
+      spx_word16_t gains[NB_NB_SUBFRAMES];
+      for (sub=0;sub<NB_NB_SUBFRAMES;sub++)
+      {
+         spx_word16_t target = MULT16_16_Q15(st->last_exc_rms[sub], fact);
+         spx_word16_t rms = compute_rms16(st->exc+sub*NB_SUBFRAME_SIZE, NB_SUBFRAME_SIZE);
+         gains[sub] = plc_gain_q13(target, rms);
+      }
+      for (i=0;i<NB_FRAME_SIZE;i++)
+      {
+         spx_word16_t gain;
+         sub = i/NB_SUBFRAME_SIZE;
+         if (sub == 0)
+         {
+            gain = gains[0];
+         } else {
+            spx_word16_t w;
+            int offset = i-sub*NB_SUBFRAME_SIZE;
+#ifdef FIXED_POINT
+            w = EXTRACT16(PDIV32(SHL32(EXTEND32(offset),15), NB_SUBFRAME_SIZE));
+#else
+            w = (spx_word16_t)offset/NB_SUBFRAME_SIZE;
+#endif
+            gain = MULT16_16_Q15(SUB16(Q15ONE,w), gains[sub-1]) +
+                   MULT16_16_Q15(w, gains[sub]);
+         }
+         st->exc[i] = plc_apply_gain(gain, st->exc[i]);
+      }
+   }
+
+   ALLOC(plc_lpc, NB_ORDER, spx_coef_t);
+   if (st->count_lost < 2)
+      bw_lpc(QCONST16(.995,15), st->interp_qlpc, plc_lpc, NB_ORDER);
+   else
+      bw_lpc(QCONST16(.98,15), st->interp_qlpc, plc_lpc, NB_ORDER);
+
+   iir_mem16(&st->exc[-NB_SUBFRAME_SIZE], plc_lpc, out, NB_FRAME_SIZE,
              NB_ORDER, st->mem_sp, stack);
    highpass(out, out, NB_FRAME_SIZE, HIGHPASS_NARROWBAND|HIGHPASS_OUTPUT, st->mem_hp);
+
+   plc_crossfade(st, out, NB_PLC_FADE);
+   for (sub=0;sub<NB_NB_SUBFRAMES;sub++)
+      st->last_exc_rms[sub] = compute_rms16(st->exc+sub*NB_SUBFRAME_SIZE, NB_SUBFRAME_SIZE);
+   st->plc_fade = NB_PLC_FADE;
+   plc_update_last_out(st, out);
 
    st->first = 0;
    st->count_lost++;
@@ -1468,6 +1588,14 @@ int nb_decode(void *state, SpeexBits *bits, void *vout)
 
       /* Final signal synthesis from excitation */
       iir_mem16(st->exc, lpc, out, NB_FRAME_SIZE, NB_ORDER, st->mem_sp, stack);
+      if (st->plc_fade > 0)
+      {
+         plc_crossfade(st, out, st->plc_fade);
+         st->plc_fade = 0;
+      }
+      for (i=0;i<NB_NB_SUBFRAMES;i++)
+         st->last_exc_rms[i] = compute_rms16(st->exc+i*NB_SUBFRAME_SIZE, NB_SUBFRAME_SIZE);
+      plc_update_last_out(st, out);
 
       /* Normally this is written to later but since this is returning early,
          avoid reading uninitialized memory in caller */
@@ -1787,6 +1915,14 @@ int nb_decode(void *state, SpeexBits *bits, void *vout)
 
    if (st->highpass_enabled)
       highpass(out, out, NB_FRAME_SIZE, (st->isWideband?HIGHPASS_WIDEBAND:HIGHPASS_NARROWBAND)|HIGHPASS_OUTPUT, st->mem_hp);
+   if (st->plc_fade > 0)
+   {
+      plc_crossfade(st, out, st->plc_fade);
+      st->plc_fade = 0;
+   }
+   for (i=0;i<NB_NB_SUBFRAMES;i++)
+      st->last_exc_rms[i] = compute_rms16(st->exc+i*NB_SUBFRAME_SIZE, NB_SUBFRAME_SIZE);
+   plc_update_last_out(st, out);
    /*for (i=0;i<NB_FRAME_SIZE;i++)
      printf ("%d\n", (int)st->frame[i]);*/
 
